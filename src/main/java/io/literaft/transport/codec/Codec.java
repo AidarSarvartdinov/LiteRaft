@@ -35,12 +35,23 @@ import io.literaft.transport.exception.ProtocolViolationException;
  */
 public class Codec {
     private static final int LENGTH_PREFIX_BYTES = Integer.BYTES;
-    private static final int MAX_PAYLOAD_LEN_BYTES = 16 * 1024 * 1024; // 16 MB
     private static final List<ByteBuffer> EMPTY_LIST = List.of();
     
+    private final int maxPayloadBytes;
     private ByteBuffer partialPayload = null;
     private final ByteBuffer lengthBuffer = ByteBuffer.allocate(LENGTH_PREFIX_BYTES);
     private int expectedPayloadLength = -1;
+
+    public Codec() {
+        this(64 * 1024);
+    }
+
+    public Codec(int maxPayloadBytes) {
+        if (maxPayloadBytes <= 0) {
+            throw new IllegalArgumentException("maxPayloadBytes must be positive");
+        }
+        this.maxPayloadBytes = maxPayloadBytes;
+    }
 
     /**
      * Wraps a payload into a single wire frame.
@@ -53,12 +64,12 @@ public class Codec {
      * @throws NullPointerException if {@code payload} is null
      * @throws ProtocolViolationException if {@code payload} exceeds {@code MAX_PAYLOAD_LEN_BYTES}
      */
-    public static byte[] encode(byte[] payload) {
+    public byte[] encode(byte[] payload) {
         if (payload == null) {
             throw new NullPointerException("payload is null");
         }
 
-        if (payload.length > MAX_PAYLOAD_LEN_BYTES) {
+        if (payload.length > maxPayloadBytes) {
             throw new ProtocolViolationException("Message length is out of bounds: " + payload.length);
         }
 
@@ -92,16 +103,54 @@ public class Codec {
         if (bytes == null) {
             throw new NullPointerException("bytes is null");
         }
-        if (bytes.length == 0) {
+
+        return decode(bytes, 0, bytes.length);
+    }
+
+    /**
+     * Consumes {@code length} valid bytes starting at {@code offset} and returns every
+     * frame that became complete.
+     *
+     * <p>Only the region {@code [offset, offset + length)} is read; the rest of the
+     * array is ignored, so a reusable read buffer can be passed without copying.
+     * Any unfinished frame (partial length prefix or partial payload) is retained
+     * internally and completed by later calls. A single call may yield zero, one or
+     * many messages.
+     *
+     * <p>Each returned buffer is in read mode ({@code position == 0},
+     * {@code limit == payload length}). Ownership of the buffers and of the returned
+     * list transfers to the caller; the list is intended for reading/iteration only.
+     *
+     * @param bytes  backing array, e.g. a reusable read buffer; not null
+     * @param offset start of the valid region, {@code >= 0}
+     * @param length number of valid bytes, {@code >= 0}; {@code offset + length <= bytes.length}
+     * @return completed payloads in arrival order, or an empty list if none completed
+     * @throws NullPointerException if {@code bytes} is null
+     * @throws IndexOutOfBoundsException if {@code offset < 0}, {@code length < 0} or
+     *         {@code offset + length > bytes.length}
+     * @throws ProtocolViolationException if a length prefix is negative or exceeds
+     *         {@code MAX_PAYLOAD_LEN_BYTES}; the instance must then be discarded
+     */
+    public List<ByteBuffer> decode(byte[] bytes, int offset, int length) {
+        if (bytes == null) {
+            throw new NullPointerException("bytes is null");
+        }
+        
+        if (offset < 0 || length < 0 || offset + length > bytes.length) {
+            throw new IndexOutOfBoundsException("offset/length out of bounds");
+        }
+
+        if (length == 0) {
             return EMPTY_LIST;
         }
 
         List<ByteBuffer> fullMessages = null;
-        int readOffset = 0;
-        while (readOffset < bytes.length) {
-            int payloadStartOffset = readMessageLength(bytes, readOffset);
+        int readOffset = offset;
+        int end = offset + length;
+        while (readOffset < end) {
+            int payloadStart = readMessageLength(bytes, readOffset, end);
 
-            if (payloadStartOffset < 0) {
+            if (payloadStart < 0) {
                 break;
             }
 
@@ -109,9 +158,9 @@ public class Codec {
                 partialPayload = ByteBuffer.allocate(expectedPayloadLength);
             }
 
-            readOffset = payloadStartOffset;
+            readOffset = payloadStart;
             int bytesToCopy = Math.min(
-                bytes.length - readOffset,
+                end - readOffset,
                 expectedPayloadLength - partialPayload.position());
             
             partialPayload.put(bytes, readOffset, bytesToCopy);
@@ -128,33 +177,37 @@ public class Codec {
             }
         }
 
-       return fullMessages == null ? EMPTY_LIST : fullMessages;
+       return fullMessages == null ? EMPTY_LIST : fullMessages;        
     }
 
     /**
      * Attempts to finish reading the length prefix starting at {@code startIdx}.
      *
-     * <p>Contract of the return value:
+     * <p>Return value:
      * <ul>
      *   <li>{@code -1} — the prefix is still incomplete; more bytes are required;</li>
      *   <li>{@code >= 0} — the offset at which the payload of the current frame begins.
-     *       It may equal {@code bytes.length} when the prefix ended exactly at the
-     *       chunk boundary.</li>
+     *       It may equal {@code end} when the prefix ended exactly at the region
+     *       boundary (payload not present in this chunk).</li>
      * </ul>
      *
-     * <p>If the length was already known from a previous call, this method returns
-     * {@code startIdx} unchanged without consuming any bytes.
+     * <p>If the payload length was already known from a previous call, this method
+     * returns {@code startIdx} unchanged without consuming any bytes.
      *
-     * @throws ProtocolViolationException if the decoded length is out of bounds
+     * @param bytes    backing array
+     * @param startIdx offset to start reading the prefix from
+     * @param end      exclusive end of the valid region
+     * @throws ProtocolViolationException if the decoded length is negative or exceeds
+     *         {@code MAX_PAYLOAD_LEN_BYTES}; state is reset before throwing
      */
-    private int readMessageLength(byte[] bytes, int startIdx) {
-        if (expectedPayloadLength >= 0 || startIdx >= bytes.length) {
+    private int readMessageLength(byte[] bytes, int startIdx, int end) {
+        if (expectedPayloadLength >= 0 || startIdx >= end) {
             return startIdx;
         }
 
         int offset = startIdx;
         int bytesToCopy = Math.min(
-            bytes.length - offset,
+            end - offset,
             LENGTH_PREFIX_BYTES - lengthBuffer.position()
         );
         lengthBuffer.put(bytes, offset, bytesToCopy);
@@ -165,7 +218,7 @@ public class Codec {
             expectedPayloadLength = lengthBuffer.getInt();
             lengthBuffer.clear();
 
-            if (expectedPayloadLength < 0 || expectedPayloadLength > MAX_PAYLOAD_LEN_BYTES) {
+            if (expectedPayloadLength < 0 || expectedPayloadLength > maxPayloadBytes) {
                 int bad = expectedPayloadLength;
                 expectedPayloadLength = -1;
                 partialPayload = null;

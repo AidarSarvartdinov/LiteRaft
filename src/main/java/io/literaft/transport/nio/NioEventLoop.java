@@ -98,11 +98,17 @@ public class NioEventLoop implements Runnable {
 
             try {
                 if (selectionKey.isConnectable()) {
-                    ((NioSocket) selectionKey.attachment()).onConnect();
+                    boolean isConnected = ((NioSocket) selectionKey.attachment()).onConnect();
+                    if (isConnected) {
+                        selectionKey.interestOps(SelectionKey.OP_READ);
+                    }
                 }
 
                 if (selectionKey.isWritable()) {
-                    ((NioSocket) selectionKey.attachment()).onWrite();
+                    boolean isFullyWritten = ((NioSocket) selectionKey.attachment()).onWrite();
+                    if (isFullyWritten)  {
+                        selectionKey.interestOpsAnd(~SelectionKey.OP_WRITE);
+                    }
                 }
 
                 if (selectionKey.isReadable()) {
